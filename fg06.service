@@ -1,0 +1,7 @@
+[Unit]
+Description="FG06"
+[Service]
+ExecStart=/usr/bin/init_usb
+Type=simple
+[Install]
+WantedBy=multi-user.target
