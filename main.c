@@ -42,7 +42,7 @@ static char VERSION[] = "XX.YY.ZZ";
 #include <signal.h>
 #include <stdarg.h>
 #include <getopt.h>
-
+#include <errno.h>
 
 #include "clk.h"
 #include "gpio.h"
@@ -63,7 +63,7 @@ static char VERSION[] = "XX.YY.ZZ";
 #define STRIP_TYPE              WS2811_STRIP_GBR		// WS2812/SK6812RGB integrated chip+leds
 //#define STRIP_TYPE            SK6812_STRIP_RGBW		// SK6812RGBW (NOT SK6812RGB)
 
-#define TAPE_LED_NUM            60
+#define TAPE_LED_NUM            110
 
 enum {
 	LED_COLOR_CLEAR  = 0x00000000,
@@ -169,6 +169,166 @@ pointLed_t pointDataSample[] =
 	{59, LED_COLOR_PURPLE, LED_BRIGHTNESS_LV1},
 	{60, LED_COLOR_YELLOW, LED_BRIGHTNESS_LV3},  // Illegal Data
 };
+
+// USBデータ取得
+typedef uint32_t RGB;// XRGB: 0xXXRRGGBB
+
+typedef struct LEDStringColor {
+    RGB rgb[TAPE_LED_NUM];
+} LEDStringColor;
+
+typedef struct LEDStringHeader {
+    uint8_t marker;
+    uint8_t num;
+    uint16_t command;
+} LEDStringHeader;
+
+typedef struct LEDString {
+    LEDStringHeader header;
+    LEDStringColor color;
+} LEDString;
+
+static const uint8_t MARKER = 0xFF;
+
+#if 0
+static int discard(int fd, uint8_t* buf)
+{
+    int ret = 0;
+    size_t sum = 0;
+    while(1) {
+        ret = read(fd, buf, 1);
+        if (ret != 1) {
+            printf("error: read() failed: %d %d\n", ret, errno);
+            return ret;
+        }
+        sum += ret;
+        if (buf[0] == MARKER) {
+            break;
+        }
+    }
+    return sum;
+}
+#endif
+
+#if 1
+static int read_buf(int fd, uint8_t* buf, size_t size)
+{
+    int ret = 0;
+    uint8_t* _buf = buf;
+    int _size = size;
+    size_t sum = 0;
+    while(1) {
+        ret = read(fd, _buf, _size);
+        if (ret < 0 || _size < ret) {
+            printf("error: read() failed: %d %d\n", ret, errno);
+            return ret;
+        }
+        _buf += ret;
+        _size -= ret;
+        sum += ret;
+        if (size <= sum) {
+            break;
+        }
+    }
+    return sum;
+}
+#endif
+
+static int find_header(const uint8_t* buf, int size)
+{
+    for (int i = 0; i < size; i++) {
+        if (buf[i] == MARKER) {
+            printf("header found\n");
+            return i;
+        }
+    }
+    return -1;
+}
+
+int captureUsb(ws2811_led_t *pMatrix)
+{
+    uint8_t buf[sizeof(LEDString)];
+    LEDString string;
+    static int fd = -1;
+    int ret;
+    int hi = -1;
+    static int nframe = 1;
+
+	if (fd == -1) {
+	    fd = open("/dev/hidg0", O_RDONLY);
+   		if (fd < 0) {
+        	printf("error: open() failed: %d %d\n", fd, errno);
+        	return fd;
+    	}
+	}
+
+#if 0 // dump USB
+	while(1)
+	{
+		uint8_t b;
+		for (int i = 0; i < 16; i++) {
+			ret = read(fd, &b, 1);
+			if (ret != 1) {
+				printf("error\n");
+			}
+			printf("%02X ", b);
+		}
+		printf("\n");
+	}
+#endif
+
+    while(1)
+    {
+        while(1)
+        {
+            printf("nframe=%d\n", nframe);
+ 	        ret = read_buf(fd, buf, sizeof(buf));
+            if (ret < 0) {
+                printf("error: read_buf() failed: %d\n", ret);
+                return ret;
+            }
+#if 0
+            printf("ret=%d\n", ret);
+            printf("buf=");
+            for (int i = 0; i < (int)sizeof(buf); i++) {
+                printf("%02x ", buf[i]);
+            }
+            printf("\n");
+#endif
+            hi = find_header(buf, sizeof(buf));
+            if (0 <= hi) {
+                break;
+            }
+        }
+        if (0 < hi) {
+            memmove(&buf[0], &buf[hi], sizeof(buf) - hi);
+            ret = read_buf(fd, &buf[sizeof(buf) - hi], hi);
+            if (ret < 0) {
+                printf("error: read_buf() failed: %d\n", ret);
+                return ret;
+            }
+        }
+        memcpy(&string, buf, sizeof(string));
+		memcpy(pMatrix, string.color.rgb, sizeof(string.color.rgb));
+#if 1
+        printf("nframe=%d\n", nframe);
+        printf("string.header.marker=%02x\n", string.header.marker);
+        printf("string.header.num=%d\n", string.header.num);
+        printf("string.header.command=%04x\n", string.header.command);
+        printf("string.color.rgb=");
+        for (int i = 0; i < TAPE_LED_NUM; i++) {
+            printf("%08x ", string.color.rgb[i]);
+        }
+        printf("\n");
+#endif
+        nframe++;
+		break;
+    }
+
+    // close(fd);
+	return 0;
+}
+
 
 // TapeLED 指定したColorMatrix情報をTapeLEDに反映させる
 void tapeLed_render(void)
@@ -332,7 +492,6 @@ void parseargs(int argc, char **argv)
 
 	while (1)
 	{
-
 		index = 0;
 		c = getopt_long(argc, argv, "c", longopts, &index);
 
@@ -360,8 +519,9 @@ void parseargs(int argc, char **argv)
 #define MOVE_M  4
 #define BLINK   5
 #define RAINBOW 6
+#define USB     7
 
-#define LED_MODE  BLINK
+#define LED_MODE  USB
 
 int myTapeLed()
 {
@@ -379,6 +539,22 @@ int myTapeLed()
 
     while (running)
     {
+#if 0
+		// USBからの入力を拾う
+		getData = (uint8_t)usbInput;
+		if (getData == 0xFF) {
+			cmd = (uint24_t)usbInput[cur + 1];
+			swith(cmd) {
+				case SIMPLE:
+				// 値の格納(4Byteずつ * LedNum)
+				// Matrixへのセット
+				// Render
+				break;
+				default:
+				break;
+			}
+		}
+#endif
 #if LED_MODE == POINT
 		ret = tapeLed_point(10, LED_COLOR_GREEN, LED_BRIGHTNESS_LV3);
 #elif LED_MODE == WHOLE
@@ -401,6 +577,13 @@ int myTapeLed()
 		ret = tapeLed_blink(blinkPtn_a, (uint8_t)ARRAY_SIZE(blinkPtn_a), LED_BRIGHTNESS_LV1, LED_UPDATE_INTERVAL_500MS);
 #elif LED_MODE == RAINBOW
 		ret = tapeLed_blink(blinkPtn_rainbow, (uint8_t)ARRAY_SIZE(blinkPtn_rainbow), LED_BRIGHTNESS_LV2, LED_UPDATE_INTERVAL_500MS);
+#elif LED_MODE == USB
+		captureUsb(gpMatrix);
+		tapeLed_render();
+		if ((ws2811_render(&ledstring)) != WS2811_SUCCESS)
+		{
+		 	// fprintf(stderr, "ws2811_render failed: %s\n", ws2811_get_return_t_str(lRet));
+		}
 #endif
 	}
 
@@ -415,20 +598,20 @@ int myTapeLed()
 }
 
 #define VER_MAJOR  0
-#define VER_MINOR  3
+#define VER_MINOR  4
 
 int main(int argc, char *argv[])
 {
-	//int verMajor = VER_MAJOR, verMinor = VER_MINOR;
     ws2811_return_t ret;
 
 	// version info
     sprintf(VERSION, "%d.%d", VER_MAJOR, VER_MINOR);
-	printf("06hackason: v%s\n", VERSION);
+	printf("FG06-hackason: v%s\n", VERSION);
 
 	// Parse Argument
 	parseargs(argc, argv);
 
+	// TapeLED 制御本体
 	ret = myTapeLed();
     return ret;
 }
